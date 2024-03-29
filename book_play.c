@@ -26,12 +26,19 @@ GPLv3
 
 #include "ws2812.pio.h"
 
+#include "hardware/irq.h"
+#include "hardware/pwm.h" 
+#include "hardware/sync.h" 
+#include "pico/rand.h"
+#include "pico/stdlib.h"
+
+#include "floppysounds.h"
+
 static inline void put_pixel(uint32_t pixel_grb) {
     pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
 }
 
 #include "xt.h"
-//#include "wspio.h"
 
 uint8_t  kbd_out_pins[8] = {2,3,4,5,6,7,8,9};
 uint8_t  int_pin = 10;
@@ -39,7 +46,65 @@ uint8_t  kbd_conn = 0;
 
 uint8_t  led_pin = 16;
 
-uint8_t  blink_pin = 14;
+uint8_t  ch375int_pin = 11;
+uint8_t  audio_pin = 12;
+
+
+uint8_t* wav_data[16];
+int wav_size[16];
+
+uint8_t* wav_current_data = NULL;
+int wav_current_size = 0;
+int wav_position = 0;
+
+const int floppy_fifo_max = 8;
+uint8_t floppy_fifo[8];
+uint8_t floppy_fifo_count = 0;
+
+void floppy_fifo_put(uint8_t value) {
+  if (floppy_fifo_count<floppy_fifo_max) {
+      floppy_fifo[floppy_fifo_count++] = value;
+  } else {
+      dprint("Buffer full!\r\n");  
+  }  
+}
+
+uint8_t floppy_fifo_get() {
+  uint8_t retval = 0;
+  if (floppy_fifo_count>0) {
+      retval = floppy_fifo[0];
+      floppy_fifo_count--;
+      for (uint8_t i=0; i<floppy_fifo_count; i++) floppy_fifo[i]=floppy_fifo[i+1];
+  }
+  return retval;
+}
+
+
+void pwm_interrupt_handler() {
+    pwm_clear_irq(pwm_gpio_to_slice_num(audio_pin));    
+    if (wav_position < (wav_current_size<<3) - 1) { 
+        // set pwm level 
+        // allow the pwm value to repeat for 8 cycles this is >>3 
+        pwm_set_gpio_level(audio_pin, wav_current_data[wav_position>>3]);  
+        wav_position++;
+    } else {
+        // reset to start
+        //wav_position = 0;
+	uint8_t flp = floppy_fifo_get();
+        if (flp != 0) {
+	    flp--;
+            wav_current_data = wav_data[flp];
+    	    wav_current_size = wav_size[flp];
+            wav_position = 0;
+        }
+    }
+}
+
+void ch375_callback(uint gpio, uint32_t event_mask) {
+    //for (int i=0; i<3; i++) {
+    floppy_fifo_put(get_rand_32() % 16);
+    //}
+}
 
 //microseconds
 //This defines microseconds delay for scanning keyboard or precessing USB input
@@ -74,7 +139,7 @@ void fifo_put(uint8_t code) {
   if (fifo_count<16) {
       fifo[fifo_count++] = code;
   } else {
-      printf("Buffer full!\r\n");  
+      dprint("Buffer full!\r\n");  
   }  
 }
 
@@ -88,22 +153,15 @@ uint8_t fifo_get() {
   return code;
 }
 
+//GRB
+uint64_t hb_color = 0x007000;
+uint64_t add_color = 0;
+
 int64_t heartbeat(alarm_id_t id, void *user_data) {
-  //gpio_put(blink_pin,heartbeat_pos&1);
-  heartbeat_pos&1 ? put_pixel(0x000000) : put_pixel(0x007000);
+  heartbeat_pos&1 ? put_pixel(0x000000|add_color) : put_pixel(0x007000|add_color);
   uint64_t retval = heartbeat_ms[heartbeat_pos++]*1000;
   heartbeat_pos&=03;
   return retval;
-}
-
-int64_t led_off(alarm_id_t id, void *user_data) {
-  put_pixel(0x000000);
-  return 0;
-}
-
-void ch375_callback(uint gpio, uint32_t event_mask) {
-  put_pixel(0xA00000);
-  add_alarm_in_ms(500,led_off,NULL,true);
 }
 
 //---------------------------
@@ -191,19 +249,6 @@ int main(void)
   gpio_init(led_pin);
   gpio_set_dir(led_pin,GPIO_OUT);
 
-
-
-  //gpio_init(blink_pin);
-  //gpio_set_dir(blink_pin,GPIO_OUT);
-  //gpio_put(blink_pin,1);
-
-  //Heartbeat function
-  //add_alarm_in_ms(100,heartbeat,NULL,true);
-
-
-  gpio_set_irq_enabled_with_callback(blink_pin, GPIO_IRQ_EDGE_FALL, true, ch375_callback);
-
-
   gpio_put(led_pin,0);
   sleep_us(200);
 
@@ -213,9 +258,87 @@ int main(void)
 
   ws2812_program_init(pio, sm, offset, led_pin, 800000, false);
 
-  //put_pixel(0x00040000);
+  //Heartbeat function
+  add_alarm_in_ms(100,heartbeat,NULL,true);
 
-tuh_init(BOARD_TUH_RHPORT);
+  wav_data[0] = &FLOPPY01_DATA[0];
+  wav_size[0] = FLOPPY01_SIZE;	
+  wav_data[1] = &FLOPPY02_DATA[0];
+  wav_size[1] = FLOPPY02_SIZE;	
+  wav_data[2] = &FLOPPY03_DATA[0];
+  wav_size[2] = FLOPPY03_SIZE;	
+  wav_data[3] = &FLOPPY04_DATA[0];
+  wav_size[3] = FLOPPY04_SIZE;	
+  wav_data[4] = &FLOPPY05_DATA[0];
+  wav_size[4] = FLOPPY05_SIZE;	
+  wav_data[5] = &FLOPPY06_DATA[0];
+  wav_size[5] = FLOPPY06_SIZE;	
+  wav_data[6] = &FLOPPY07_DATA[0];
+  wav_size[6] = FLOPPY07_SIZE;	
+  wav_data[7] = &FLOPPY08_DATA[0];
+  wav_size[7] = FLOPPY08_SIZE;	
+  wav_data[8] = &FLOPPY09_DATA[0];
+  wav_size[8] = FLOPPY09_SIZE;	
+  wav_data[9] = &FLOPPY10_DATA[0];
+  wav_size[9] = FLOPPY10_SIZE;	
+  wav_data[10] = &FLOPPY11_DATA[0];
+  wav_size[10] = FLOPPY11_SIZE;	
+  wav_data[11] = &FLOPPY12_DATA[0];
+  wav_size[11] = FLOPPY12_SIZE;	
+  wav_data[12] = &FLOPPY13_DATA[0];
+  wav_size[12] = FLOPPY13_SIZE;	
+  wav_data[13] = &FLOPPY14_DATA[0];
+  wav_size[13] = FLOPPY14_SIZE;	
+  wav_data[14] = &FLOPPY15_DATA[0];
+  wav_size[14] = FLOPPY15_SIZE;	
+  wav_data[15] = &FLOPPY16_DATA[0];
+  wav_size[15] = FLOPPY16_SIZE;	
+
+  wav_current_data = &FLOPPY00_DATA[0];
+  wav_current_size = FLOPPY00_SIZE;
+
+  //should be _FALL for CH375B
+  //gpio_set_irq_enabled_with_callback(CHINT_PIN, GPIO_IRQ_EDGE_RISE, true, ch375_callback);
+  gpio_set_irq_enabled_with_callback(ch375int_pin, GPIO_IRQ_EDGE_FALL, true, ch375_callback);
+
+    /* Overclocking for fun but then also so the system clock is a 
+     * multiple of typical audio sampling rates.
+     */
+  stdio_init_all();
+  gpio_set_function(audio_pin, GPIO_FUNC_PWM);
+
+  int audio_pin_slice = pwm_gpio_to_slice_num(audio_pin);
+
+  // Setup PWM interrupt to fire when PWM cycle is complete
+  pwm_clear_irq(audio_pin_slice);
+  pwm_set_irq_enabled(audio_pin_slice, true);
+  // set the handle function above
+  irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_interrupt_handler); 
+  irq_set_enabled(PWM_IRQ_WRAP, true);
+
+  // Setup PWM for audio output
+  pwm_config config = pwm_get_default_config();
+  /* Base clock 176,000,000 Hz divide by wrap 250 then the clock divider further divides
+   * to set the interrupt rate. 
+   * 
+   * 11 KHz is fine for speech. Phone lines generally sample at 8 KHz
+   * 
+   * 
+   * So clkdiv should be as follows for given sample rate
+   *  8.0f for 11 KHz
+   *  4.0f for 22 KHz
+   *  2.0f for 44 KHz etc
+   */
+  //Overclock breaks PIO 
+  //set_sys_clock_khz(176000, true);
+  pwm_config_set_clkdiv(&config, 8.0f); 
+  //pwm_config_set_wrap(&config, 250); 
+  pwm_config_set_wrap(&config, 177);
+  pwm_init(audio_pin_slice, &config, true);
+
+  pwm_set_gpio_level(audio_pin, 0);
+
+  tuh_init(BOARD_TUH_RHPORT);
 
 //--------------------------------------------------
 //Main loop
@@ -274,13 +397,13 @@ void tuh_umount_cb(uint8_t dev_addr)
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_report, uint16_t desc_len) {
 //  printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
   board_led_write(1);
-  //put_pixel(0x00040404);
+  add_color=0x100010;
   kbd_conn = 1;
   clear_pins();
   if(tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD) {
     if ( !tuh_hid_receive_report(dev_addr, instance) )
     {
-      printf("Error: cannot request to receive report\r\n");
+      dprint("Error: cannot request to receive report\r\n");
     }
   }
 }
@@ -288,7 +411,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
 // Invoked when device with hid interface is un-mounted
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
   board_led_write(0);
-  //put_pixel(0x00040000);
+  add_color=0x0;
   gpio_put(16,0);
   kbd_conn = 0;
   clear_pins();
@@ -316,7 +439,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
   // continue to request to receive report
   if ( !tuh_hid_receive_report(dev_addr, instance) )
   {
-    printf("Error: cannot request to receive report\r\n");
+    dprint("Error: cannot request to receive report\r\n");
   }
 }
 
